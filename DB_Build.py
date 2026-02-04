@@ -22,7 +22,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 1. DINOv2 모델 로드
 print("DINOv2 모델 로딩 중...")
-model_dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device)
+model_dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(device)
 model_dinov2.eval()
 print("✓ DINOv2 모델 로드 완료!")
 
@@ -97,7 +97,7 @@ print(f"\n✓ 총 {len(defect_database)}개의 이미지 특징 추출 완료!")
 def initialize_db():
     conn_params = {
         "host": "localhost",
-        "database": "postgres",  # DBeaver 확인용
+        "database": "postgres",
         "user": "postgres",
         "password": "3510",
         "port": 5432
@@ -105,21 +105,28 @@ def initialize_db():
     try:
         conn = psycopg2.connect(**conn_params)
         cur = conn.cursor()
+
+        # 1. 벡터 확장 기능 활성화
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        # vitb14 모델을 쓰시므로 차원을 768로 맞춰야 에러가 안 납니다!
+
+        # 2. [수정 포인트] 기존 테이블이 있으면 삭제 (차원 변경 및 중복 방지)
+        print("기존 테이블을 삭제하고 1024차원용으로 새로 생성합니다...")
+        cur.execute("DROP TABLE IF EXISTS semiconductor_defects;")
+
+        # 3. 1024차원(ViT-L/14) 벡터 테이블 생성
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS semiconductor_defects (
+            CREATE TABLE semiconductor_defects (
                 id serial PRIMARY KEY,
                 image_name text,
                 defect_type text,
-                feature_vector vector(768), 
+                feature_vector vector(1024), 
                 mask_path text
             );
         """)
         conn.commit()
         return conn, cur
     except Exception as e:
-        print(f"✗ DB 연결 실패: {e}")
+        print(f"✗ DB 초기화 실패: {e}")
         return None, None
 
 
@@ -130,29 +137,38 @@ if __name__ == "__main__":
         register_vector(conn)
 
         # 2. 이미지 파일 리스트 확보
-        image_files = glob.glob(os.path.join(r"C:\Users\hjchung\Desktop\RAG Train", "**", "*.png"), recursive=True)
+        base_dir = r"C:\Users\hjchung\Desktop\RAG Train"
+        extensions = ('*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.bmp', '*.BMP')
+        image_files = []
+        for ext in extensions:
+            image_files.extend(glob.glob(os.path.join(base_dir, "**", ext), recursive=True))
 
-        print(f"🚀 총 {len(image_files)}개 이미지 처리 및 DB 저장 시작...")
+        print(f"🚀 총 {len(image_files)}개 이미지 발견 (예상: 700개)")
+        print(f"시작 전 기존 데이터를 삭제합니다...")
+        cur.execute("TRUNCATE TABLE semiconductor_defects;")  # 중복 방지용 초기화
+        conn.commit()
 
         for idx, image_path in enumerate(image_files):
+            img_name = os.path.basename(image_path)
             try:
-                # 특징 추출
+                # 1. 특징 추출
                 feature_vector = extract_dinov2_features(image_path, model_dinov2, device)
                 defect_type = os.path.basename(os.path.dirname(image_path))
-                img_name = os.path.basename(image_path)
 
-                # 3. 추출 즉시 DB에 INSERT (리스트에 쌓아두지 말고 바로 넣으세요)
+                # 2. DB에 INSERT
                 cur.execute("""
-                    INSERT INTO semiconductor_defects (image_name, defect_type, feature_vector, mask_path)
-                    VALUES (%s, %s, %s, %s);
-                """, (img_name, defect_type, feature_vector.tolist(), "none"))
+                            INSERT INTO semiconductor_defects (image_name, defect_type, feature_vector, mask_path)
+                            VALUES (%s, %s, %s, %s);
+                        """, (img_name, defect_type, feature_vector.tolist(), "none"))
 
                 if idx % 50 == 0:
-                    conn.commit()  # 50개마다 중간 저장
+                    conn.commit()
                     print(f"  [{idx}/{len(image_files)}] 저장 중...")
 
             except Exception as e:
-                print(f"  ✗ {img_name} 처리 실패: {e}")
+                # [핵심] 에러 발생 시 현재 트랜잭션을 롤백하여 다음 데이터가 들어갈 수 있게 함
+                conn.rollback()
+                print(f"  ✗ {img_name} 처리 실패 및 롤백 수행: {e}")
 
         conn.commit()  # 최종 저장
         cur.close()

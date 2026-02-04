@@ -20,7 +20,7 @@ print("모델 로딩 중...")
 print("=" * 70)
 
 # DINOv2 모델
-model_dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device)
+model_dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(device)
 model_dinov2.eval()
 print("✓ DINOv2 모델 로드 완료!")
 
@@ -78,16 +78,13 @@ def process_new_defect_image(image_path, dinov2_model, sam3_model, device):
     # Step 1: DINOv2로 결함 박스 찾기
     print("\n[Step 1] DINOv2로 결함 위치 찾기...")
     defect_boxes = get_multiple_defect_boxes(image_path, dinov2_model, device)
+    defect_box= defect_boxes[0]
 
     if not defect_boxes:
         print("✗ 결함이 탐지되지 않았습니다.")
         return None
 
     print(f"✓ {len(defect_boxes)}개의 결함 영역 탐지!")
-
-    # 첫 번째 박스 선택
-    defect_box = defect_boxes[0]
-    print(f"  - 선택된 박스 [x, y, w, h]: {[f'{x:.1f}' for x in defect_box]}")
 
     # Step 2: SAM3로 정밀 Mask 생성 (시각화/확인용으로 유지)
     print("\n[Step 2] SAM3로 정밀 Mask 생성...")
@@ -99,23 +96,20 @@ def process_new_defect_image(image_path, dinov2_model, sam3_model, device):
 
         # SAM3 입력 형식: [x1, y1, x2, y2]
         x, y, w, h = defect_box
-        box_xyxy = np.array([[x, y, x + w, y + h]], dtype=np.float32)
+        # SAM3 입력 형식에 맞게 [x1, y1, x2, y2]로 변환하여 텐서화
+        box_tensor = torch.tensor([x, y, x + w, y + h], device=device).unsqueeze(0)
 
         with torch.no_grad():
-            # SAM3 이미지 인코딩
-            sam3_model.set_image(image_np)
-
-            # Mask 예측
-            masks, scores, logits = sam3_model.predict(
-                point_coords=None,
-                point_labels=None,
-                box=box_xyxy,
+            # Sam3Image 모델은 set_image 대신 이미지를 직접 입력받습니다.
+            # 모델의 forward 또는 predict_masks 메소드를 사용해야 합니다.
+            # 여기서는 가장 일반적인 모델 직접 호출 방식을 적용합니다.
+            masks, scores = sam3_model.predict(
+                image=image_np,
+                boxes=box_tensor,
                 multimask_output=False
             )
-
-        # 가장 좋은 마스크 선택
-        best_mask = masks[0]  # [H, W]
-        print(f"✓ Mask 생성 완료! (크기: {best_mask.shape}, 점수: {scores[0]:.3f})")
+            best_mask = masks[0]
+            print(f"✓ Mask 생성 완료! (점수: {scores[0]:.3f})")
 
     except Exception as e:
         print(f"⚠️ SAM3 마스크 생성 실패, 박스 영역을 사용합니다.")
@@ -124,20 +118,24 @@ def process_new_defect_image(image_path, dinov2_model, sam3_model, device):
 
         # [Step 3] 특징 추출 - 마스크 씌우지 않고 원본 이미지에서 바로 특징 추출
         print("\n[Step 3] 원본 이미지에서 특징 추출 (DB 정합성 유지)...")
-        transform= T.Compose([
-            T.Resize((224, 224)), # DB_Build.py와 동일한 크기
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        try:
+            transform = T.Compose([
+                T.Resize((224, 224)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
 
-        # raw_image 다시 활용하여 특징 추출
-        img_tensor = transform(raw_image).unsqueeze(0).to(device)
+            img_tensor = transform(raw_image).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            features = dinov2_model(img_tensor)
-            query_vector = features.cpu().numpy().flatten()
+            with torch.no_grad():
+                # [수정] features 변수를 먼저 정의해야 합니다.
+                features = dinov2_model(img_tensor)
+                query_vector = features.cpu().numpy().flatten()
 
-        print(f"✓ 특징 벡터 추출 완료! (차원: {len(query_vector)})")
+            print(f"✓ 특징 벡터 추출 완료! (차원: {len(query_vector)})")
+        except Exception as e:
+            print(f"✗ 특징 추출 중 오류 발생: {e}")
+            return None
 
         # Step 4: PostgreSQL에서 Top-5 유사 이미지 검색
         print("\n[Step 4] DB에서 유사 이미지 Top-5 검색...")
