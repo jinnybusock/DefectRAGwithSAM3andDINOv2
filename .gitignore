@@ -1,0 +1,4 @@
+dinov2_semicon_contrastive.pt
+sam3.pt
+*.pt
+venv/
