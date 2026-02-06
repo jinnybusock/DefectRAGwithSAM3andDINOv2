@@ -1,5 +1,8 @@
 import os
 import sys
+
+from timm.data.tf_preprocessing import preprocess_image
+
 from connection import initialize_project
 
 initialize_project()
@@ -13,6 +16,8 @@ from DINOv2_FeatureMap import get_multiple_defect_boxes
 from collections import defaultdict
 from sam3 import build_sam3_image_model
 from show_image import visualize_defect_results
+import cv2
+import numpy as np
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -54,9 +59,18 @@ def process_new_defect_image(image_path, dinov2_model, predictor_sam,device, thr
     print(f"📸 분석 시작: {os.path.basename(image_path)} (임계값: {threshold})")
     print(f"{'=' * 70}")
 
+    def apply_clahe(img_path):
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl_img = clahe.apply(img)
+        return cv2.cvtColor(cl_img, cv2.COLOR_GRAY2RGB)
+
+    # 실제 전처리 작용: 기존 원본 이미지 대신 대비가 강조된 이미지 생성
+    preprocess_image_np= apply_clahe(image_path)
+
     # [Step 1] DINOv2로 결함 위치(Box) 찾기
     print("\n[Step 1] DINOv2로 결함 위치 탐지 중...")
-    found_boxes = get_multiple_defect_boxes(image_path, dinov2_model, device)
+    found_boxes = get_multiple_defect_boxes(preprocess_image_np, dinov2_model, device)
 
     if not found_boxes:
         print("✗ 결함이 탐지되지 않았습니다.")
@@ -69,8 +83,9 @@ def process_new_defect_image(image_path, dinov2_model, predictor_sam,device, thr
 
     # [Step 2] SAM3로 정밀 Mask 생성
     print("\n[Step 2] SAM3로 정밀 Mask 생성 중...")
-    raw_image = Image.open(image_path).convert('RGB')
-    image_np = np.array(raw_image)
+
+    image_np = preprocess_image_np     # 원본 대신 CLAHE 적용 이미지 사용
+    raw_image = Image.fromarray(image_np)     # 특징 추출용 Image 객체로 변환
 
     try:
         x, y, w, h = defect_box
